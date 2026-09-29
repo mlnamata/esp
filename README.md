@@ -2,6 +2,7 @@
 
 Arduino **Nicla Vision** (OpenMV / MicroPython) kouká kamerou dolů na přistávací
 značku a navádí dron: říká mu, kam se má posunout, jak se natočit a kdy klesat.
+Povely do stran a otáčení jsou v **procentech**, nahoru / dolů jako **rychlost** (mm/s).
 Povely vypisuje čitelně do terminálu a zároveň je posílá po UARTu, aby je
 v další fázi mohla přímo použít řídicí jednotka dronu.
 
@@ -17,12 +18,13 @@ Na papíře jsou dva prvky:
 Pro každý snímek program:
 
 1. najde kříž (tmavý souměrný útvar s černým středem) a červený pruh ve správné vzdálenosti,
-2. spočítá, kde je střed kříže vůči středu dronu (v mm) – měřítko bere
+2. spočítá, kde je střed kříže vůči středu dronu – měřítko bere
    z laserového dálkoměru VL53L1X na Nicle, případně z velikosti kříže,
 3. spočítá natočení ze směru středu → pruh, zpřesní ho podle osy pruhu a hran kříže (± 1°),
 4. přiřadí rohy kříže ramenům dronu (`PP` přední pravé, `PL`, `ZL`, `ZP`),
 5. stavový automat rozhodne, co dělat (natočit / dorovnat / klesat / dosednout),
-6. vypíše povel do terminálu a pošle řádek `$NLAND,...` po UARTu.
+6. z odchylek udělá povely v % (čím dál od středu, tím víc %, max. 50 %),
+7. vypíše povel do terminálu a pošle řádek `$NLAND,...` po UARTu.
 
 ## Přistávací značka
 
@@ -89,7 +91,9 @@ Vše je na začátku `main.py`:
 | `KAMERA_POSUN_VPRED_MM`, `..._VPRAVO_MM` | 0 | poloha kamery vůči středu dronu |
 | `PRAH_CERNA`, `PRAH_CERVENA` | – | barevné prahy LAB (Tools → Machine Vision → Threshold Editor) |
 | `TOL_POZICE_MM`, `TOL_UHEL_DEG` | 25 mm, 4° | tolerance pro klesání |
-| `KP_POZICE`, `KP_UHEL`, `MAX_*` | – | zesílení a limity doporučených rychlostí |
+| `KP_BOK`, `MAX_BOK` | 0,25 %/mm, 50 % | povel do stran: 100 mm odchylky → 25 %, nejvýš 50 % |
+| `KP_TOC`, `MAX_TOC` | 2 %/°, 50 % | povel otáčení: 10° odchylky → 20 %, nejvýš 50 % |
+| `KLESANI_MM_S`, `KLESANI_POMALU_MM_S` | 250, 100 | rychlost klesání (pomalu pod `VYSKA_POMALU_MM`) |
 | `VYSKA_DOSEDNUTI_MM` | 150 | pod touto výškou stav `DOSEDNUTI` |
 | `VYPIS_POVELU` | True | čitelné povely do terminálu |
 | `VYPIS_PROTOKOLU` | False | navíc surové řádky `$NLAND` do terminálu |
@@ -98,12 +102,12 @@ Vše je na začátku `main.py`:
 ## Kalibrace (5 minut, bez letu)
 
 1. Drž dron (s Niclou) nad papírem natočený přesně tak, jak má přistát.
-   V terminálu musí být `otocit ... 0°` a ve framebufferu musí u ramen kříže svítit
-   správné zkratky (`PP` u předního pravého ramene dronu atd.).
-2. Posuň papír před příď dronu → terminál musí hlásit `vpred`.
-   Posuň ho doprava → `vpravo`. Pokud ne, uprav `KAMERA_OTOCENI_DEG`,
+   V terminálu nesmí být žádný povel `TOC` a ve framebufferu musí u ramen kříže
+   svítit správné zkratky (`PP` u předního pravého ramene dronu atd.).
+2. Posuň papír před příď dronu → terminál musí hlásit `VPRED … %`.
+   Posuň ho doprava → `VPRAVO … %`. Pokud ne, uprav `KAMERA_OTOCENI_DEG`,
    případně `KAMERA_ZRCADLIT` (obraz musí vypadat jako pohled shora).
-3. Pootoč papír po směru hodin → terminál musí hlásit `otocit vpravo`
+3. Pootoč papír po směru hodin → terminál musí hlásit `TOC VPRAVO … %`
    (dron se má točit za papírem).
 4. Když kříž nebo pruh občas zmizí, dolaď prahy v Threshold Editoru.
 
@@ -112,40 +116,39 @@ Vše je na začátku `main.py`:
 Ukázka ze simulace přistání (dron začíná 20 cm vedle a 70° natočený):
 
 ```
-NATACENI  | vzad 99 mm, vlevo 167 mm, otocit vlevo 70°, vyska 900 mm | POVEL: VZAD 79 mm/s, VLEVO 134 mm/s, TOC VLEVO 45°/s
-NAVADENI  | vpred 21 mm, vlevo 40 mm, otocit vlevo 9°, vyska 900 mm | POVEL: VPRED 17 mm/s, VLEVO 32 mm/s, TOC VLEVO 11°/s
-KLESANI   | vpred 5 mm, vlevo 8 mm, otocit vlevo 1°, vyska 700 mm | POVEL: VPRED 4 mm/s, VLEVO 6 mm/s, TOC VLEVO 2°/s, KLESEJ 250 mm/s
-KLESANI   | vpred 0 mm, vpravo 0 mm, otocit vpravo 0°, vyska 332 mm | POVEL: KLESEJ 100 mm/s
-DOSEDNUTI | vpred 0 mm, vpravo 0 mm, otocit vpravo 0°, vyska 147 mm | POVEL: DOSEDNI A VYPNI MOTORY, KLESEJ 100 mm/s
-HLEDANI   | znacka nenalezena | POVEL: DRZ POZICI
+NATACENI  | POVEL: VZAD 25 %, VLEVO 42 %, TOC VLEVO 50 %
+NAVADENI  | POVEL: VPRED 1 %, VLEVO 2 %, TOC VLEVO 28 %
+KLESANI   | POVEL: TOC VLEVO 4 %, DOLU 250 mm/s
+KLESANI   | POVEL: DOLU 100 mm/s
+DOSEDNUTI | POVEL: DOSEDNI A VYPNI MOTORY, DOLU 100 mm/s
+HLEDANI   | POVEL: DRZ POZICI (znacka nenalezena)
 ```
 
-- první část = **odchylka**: kde je značka vůči dronu a o kolik se má otočit,
-- `POVEL` = **co má dron udělat** (rychlosti vpřed/vzad, vlevo/vpravo, otáčení, klesání).
+- `VPRED` / `VZAD`, `VLEVO` / `VPRAVO`, `TOC VLEVO` / `TOC VPRAVO` – v **%**
+  (100 % = plná výchylka; jak ji dron přepočte na náklon/rychlost, je na něm),
+- `NAHORU` / `DOLU` – **rychlost** v mm/s,
+- co je 0, se nevypisuje; když je všechno 0 → `DRZ POZICI`.
 
 ## Protokol UART (pro samostatné řízení dronu)
 
 Každý snímek (~20–30× za sekundu) jeden řádek ASCII:
 
 ```
-$NLAND,seq,stav,dx,dy,yaw,vyska,vx,vy,vyaw,vz*CS\r\n
+$NLAND,seq,stav,vpred,vpravo,toc,vz*CS\r\n
 ```
 
 | Pole | Jednotka | Význam |
 |---|---|---|
 | `seq` | – | pořadové číslo 0–65535 (dokola) |
 | `stav` | – | viz tabulka stavů |
-| `dx` | mm | značka je **před** dronem o `dx` (záporné = za) |
-| `dy` | mm | značka je **vpravo** od dronu o `dy` (záporné = vlevo) |
-| `yaw` | ° | o kolik se otočit **doprava** (po směru hodin shora), záporné = doleva |
-| `vyska` | mm | výška nad značkou, `-1` = neznámá |
-| `vx` | mm/s | doporučená rychlost vpřed (záporná = vzad) |
-| `vy` | mm/s | doporučená rychlost vpravo (záporná = vlevo) |
-| `vyaw` | °/s | doporučená rychlost otáčení doprava (záporná = doleva) |
-| `vz` | mm/s | doporučená rychlost klesání (0 = držet výšku) |
+| `vpred` | % | dopředu (záporné = dozadu), -100 až 100 |
+| `vpravo` | % | doprava (záporné = doleva), -100 až 100 |
+| `toc` | % | otáčení doprava / po směru hodin shora (záporné = doleva), -100 až 100 |
+| `vz` | mm/s | rychlost nahoru (záporné = dolů), 0 = držet výšku |
 | `CS` | hex | XOR všech znaků mezi `$` a `*` (jako NMEA) |
 
-Všechny hodnoty jsou celá čísla. Příklad: `$NLAND,7,4,12,-4,-2,480,10,-3,-2,100*42`
+Všechny hodnoty jsou celá čísla. Příklad: `$NLAND,7,4,10,-3,-4,-250*56`
+= klesá, 10 % dopředu, 3 % doleva, točit 4 % doleva, dolů 250 mm/s.
 
 ### Stavy
 
@@ -165,7 +168,9 @@ Všechny hodnoty jsou celá čísla. Příklad: `$NLAND,7,4,12,-4,-2,480,10,-3,-
 #include <string.h>
 
 typedef struct {
-    int seq, stav, dx, dy, yaw, vyska, vx, vy, vyaw, vz;
+    int seq, stav;
+    int vpred, vpravo, toc;   // %
+    int vz;                   // mm/s, + nahoru, - dolů
 } NlandZprava;
 
 // Vrátí 1, pokud je řádek platný (včetně kontrolního součtu)
@@ -177,9 +182,8 @@ int nland_parse(const char *radek, NlandZprava *z) {
     for (const char *p = radek + 1; p < hvezda; p++) cs ^= (unsigned char)*p;
     unsigned int cs_prijaty;
     if (sscanf(hvezda + 1, "%2x", &cs_prijaty) != 1 || cs_prijaty != cs) return 0;
-    return sscanf(radek, "$NLAND,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-                  &z->seq, &z->stav, &z->dx, &z->dy, &z->yaw, &z->vyska,
-                  &z->vx, &z->vy, &z->vyaw, &z->vz) == 10;
+    return sscanf(radek, "$NLAND,%d,%d,%d,%d,%d,%d",
+                  &z->seq, &z->stav, &z->vpred, &z->vpravo, &z->toc, &z->vz) == 6;
 }
 ```
 

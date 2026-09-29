@@ -30,7 +30,7 @@ UART_PORT      = "LP1"    # Nicla Vision: TX = PA9, RX = PA10 (3,3 V logika)
 UART_RYCHLOST  = 115200
 
 # ── Výpis do terminálu (OpenMV IDE / USB) ─────────────────────────────────
-VYPIS_POVELU      = True   # čitelné povely pro dron (VPRED, TOC VLEVO, KLESEJ…)
+VYPIS_POVELU      = True   # čitelné povely pro dron (VPRED 20 %, TOC VLEVO 10 %, DOLU 250 mm/s…)
 VYPIS_PROTOKOLU   = False  # navíc surové řádky $NLAND (to, co jde po UARTu)
 VYPIS_INTERVAL_MS = 200    # jak často vypisovat; změna stavu se vypíše hned
 
@@ -70,12 +70,14 @@ HYSTEREZE               = 2.0   # při klesání se tolerance násobí (neškube
 VYSKA_POMALU_MM         = 600   # pod touto výškou klesat pomalu
 VYSKA_DOSEDNUTI_MM      = 150   # pod touto výškou → DOSEDNUTI
 
-# ── Regulace (P regulátor) ────────────────────────────────────────────────
-KP_POZICE          = 0.8   # [1/s]   rychlost = KP × odchylka
-MAX_RYCHLOST_MM_S  = 300
-KP_UHEL            = 1.2   # [1/s]
-MAX_OTACENI_DEG_S  = 45
-KLESANI_MM_S       = 250
+# ── Povely (P regulátor) ──────────────────────────────────────────────────
+# Do stran a otáčení v procentech: 100 % = plná výchylka, dron si je přepočte
+KP_BOK     = 0.25   # [%/mm]  100 mm odchylky → 25 %
+MAX_BOK    = 50     # [%]
+KP_TOC     = 2.0    # [%/°]   10° odchylky → 20 %
+MAX_TOC    = 50     # [%]
+# Nahoru / dolů jako rychlost [mm/s]
+KLESANI_MM_S        = 250
 KLESANI_POMALU_MM_S = 100
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -312,8 +314,9 @@ class Navadeni:
         self.posledni_ms = 0
 
     def krok(self, m, vyska_tof, ted_ms):
-        # Vrátí (stav, vx, vy, vyaw, vz):
-        #   vx vpřed, vy vpravo, vz dolů [mm/s], vyaw doprava [°/s]
+        # Vrátí (stav, vpred, vpravo, toc, vz):
+        #   vpred, vpravo, toc (doprava) v % (-100..100)
+        #   vz v mm/s: kladná = nahoru, záporná = dolů
         vyska = m["vyska"] if m is not None else vyska_tof
 
         # Dosednutí je „zamčené“, dokud dron znovu nevzlétne
@@ -321,14 +324,14 @@ class Navadeni:
             if vyska > 2 * VYSKA_DOSEDNUTI_MM:
                 self.dosednuto = False
             else:
-                return self._stav(DOSEDNUTI), 0, 0, 0, KLESANI_POMALU_MM_S
+                return self._stav(DOSEDNUTI), 0, 0, 0, -KLESANI_POMALU_MM_S
 
         if m is None:
             # Těsně nad zemí kamera značku ztratí – to je v pořádku
             if (self.stav == KLESANI and 0 < self.posledni_vyska < 2 * VYSKA_DOSEDNUTI_MM
                     and time.ticks_diff(ted_ms, self.posledni_ms) < 1000):
                 self.dosednuto = True
-                return self._stav(DOSEDNUTI), 0, 0, 0, KLESANI_POMALU_MM_S
+                return self._stav(DOSEDNUTI), 0, 0, 0, -KLESANI_POMALU_MM_S
             self.stabilni = 0
             return self._stav(HLEDANI), 0, 0, 0, 0
 
@@ -336,33 +339,33 @@ class Navadeni:
             self.posledni_vyska = vyska
         self.posledni_ms = ted_ms
 
-        vx = omez(KP_POZICE * m["dx"], MAX_RYCHLOST_MM_S)
-        vy = omez(KP_POZICE * m["dy"], MAX_RYCHLOST_MM_S)
+        vpred = omez(KP_BOK * m["dx"], MAX_BOK)
+        vpravo = omez(KP_BOK * m["dy"], MAX_BOK)
         if m["yaw"] is None:
             self.stabilni = 0
-            return self._stav(JEN_KRIZ), vx, vy, 0, 0
+            return self._stav(JEN_KRIZ), vpred, vpravo, 0, 0
 
         yaw = m["yaw"]
-        vyaw = omez(KP_UHEL * yaw, MAX_OTACENI_DEG_S)
+        toc = omez(KP_TOC * yaw, MAX_TOC)
         chyba = math.sqrt(m["dx"] ** 2 + m["dy"] ** 2)
         k = HYSTEREZE if self.stav == KLESANI else 1.0
 
         if abs(yaw) > UHEL_NEJDRIV_NATOCIT:
             self.stabilni = 0
-            return self._stav(NATACENI), vx, vy, vyaw, 0
+            return self._stav(NATACENI), vpred, vpravo, toc, 0
         if chyba > TOL_POZICE_MM * k or abs(yaw) > TOL_UHEL_DEG * k:
             self.stabilni = 0
-            return self._stav(NAVADENI), vx, vy, vyaw, 0
+            return self._stav(NAVADENI), vpred, vpravo, toc, 0
 
         self.stabilni += 1
         if self.stav != KLESANI and self.stabilni < STABILNI_SNIMKY:
-            return self._stav(NAVADENI), vx, vy, vyaw, 0
+            return self._stav(NAVADENI), vpred, vpravo, toc, 0
 
         if 0 < vyska < VYSKA_DOSEDNUTI_MM:
             self.dosednuto = True
-            return self._stav(DOSEDNUTI), 0, 0, 0, KLESANI_POMALU_MM_S
-        vz = KLESANI_POMALU_MM_S if 0 < vyska < VYSKA_POMALU_MM else KLESANI_MM_S
-        return self._stav(KLESANI), vx, vy, vyaw, vz
+            return self._stav(DOSEDNUTI), 0, 0, 0, -KLESANI_POMALU_MM_S
+        vz = -(KLESANI_POMALU_MM_S if 0 < vyska < VYSKA_POMALU_MM else KLESANI_MM_S)
+        return self._stav(KLESANI), vpred, vpravo, toc, vz
 
     def _stav(self, s):
         self.stav = s
@@ -370,17 +373,10 @@ class Navadeni:
 
 
 # ── Protokol ──────────────────────────────────────────────────────────────
-def zprava(seq, stav, m, vx, vy, vyaw, vz):
-    # $NLAND,seq,stav,dx,dy,yaw,vyska,vx,vy,vyaw,vz*CS
-    if m is None:
-        dx = dy = yaw = 0
-        vyska = -1
-    else:
-        dx = m["dx"]
-        dy = m["dy"]
-        yaw = m["yaw"] if m["yaw"] is not None else 0
-        vyska = m["vyska"]
-    hodnoty = (seq, stav, dx, dy, yaw, vyska, vx, vy, vyaw, vz)
+def zprava(seq, stav, vpred, vpravo, toc, vz):
+    # $NLAND,seq,stav,vpred,vpravo,toc,vz*CS
+    #   vpred, vpravo, toc [%], vz [mm/s] (+ nahoru, - dolů)
+    hodnoty = (seq, stav, vpred, vpravo, toc, vz)
     telo = "NLAND," + ",".join(str(int(round(v))) for v in hodnoty)
     cs = 0
     for ch in telo:
@@ -388,43 +384,32 @@ def zprava(seq, stav, m, vx, vy, vyaw, vz):
     return "$%s*%02X\r\n" % (telo, cs)
 
 
-def povel_text(stav, m, vx, vy, vyaw, vz):
+def povel_text(stav, vpred, vpravo, toc, vz):
     # Čitelný řádek do terminálu, např.:
-    # NAVADENI  | vpred 45 mm, vlevo 12 mm, otocit vlevo 3°, vyska 520 mm
-    #           | POVEL: VPRED 36 mm/s, VLEVO 10 mm/s, TOC VLEVO 4°/s
-    if m is None:
-        odchylka = "znacka nenalezena"
-    else:
-        dx = int(round(m["dx"]))
-        dy = int(round(m["dy"]))
-        odchylka = "%s %d mm, %s %d mm" % ("vpred" if dx >= 0 else "vzad", abs(dx),
-                                           "vpravo" if dy >= 0 else "vlevo", abs(dy))
-        if m["yaw"] is None:
-            odchylka += ", natoceni nezname (nevidim cerveny pruh)"
-        else:
-            yaw = int(round(m["yaw"]))
-            odchylka += ", otocit %s %d°" % ("vpravo" if yaw >= 0 else "vlevo", abs(yaw))
-        if m["vyska"] > 0:
-            odchylka += ", vyska %d mm" % int(m["vyska"])
-
+    # NAVADENI  | POVEL: VPRED 12 %, VLEVO 30 %, TOC VLEVO 20 %
+    vpred = int(round(vpred))
+    vpravo = int(round(vpravo))
+    toc = int(round(toc))
+    vz = int(round(vz))
     povely = []
     if stav == DOSEDNUTI:
         povely.append("DOSEDNI A VYPNI MOTORY")
-    vx = int(round(vx))
-    vy = int(round(vy))
-    vyaw = int(round(vyaw))
-    vz = int(round(vz))
-    if vx:
-        povely.append("%s %d mm/s" % ("VPRED" if vx > 0 else "VZAD", abs(vx)))
-    if vy:
-        povely.append("%s %d mm/s" % ("VPRAVO" if vy > 0 else "VLEVO", abs(vy)))
-    if vyaw:
-        povely.append("TOC %s %d°/s" % ("VPRAVO" if vyaw > 0 else "VLEVO", abs(vyaw)))
+    if vpred:
+        povely.append("%s %d %%" % ("VPRED" if vpred > 0 else "VZAD", abs(vpred)))
+    if vpravo:
+        povely.append("%s %d %%" % ("VPRAVO" if vpravo > 0 else "VLEVO", abs(vpravo)))
+    if toc:
+        povely.append("TOC %s %d %%" % ("VPRAVO" if toc > 0 else "VLEVO", abs(toc)))
     if vz:
-        povely.append("KLESEJ %d mm/s" % vz)
+        povely.append("%s %d mm/s" % ("NAHORU" if vz > 0 else "DOLU", abs(vz)))
     if not povely:
         povely.append("DRZ POZICI")
-    return "%-9s | %s | POVEL: %s" % (NAZVY_STAVU[stav], odchylka, ", ".join(povely))
+    text = "%-9s | POVEL: %s" % (NAZVY_STAVU[stav], ", ".join(povely))
+    if stav == HLEDANI:
+        text += " (znacka nenalezena)"
+    elif stav == JEN_KRIZ:
+        text += " (nevidim cerveny pruh)"
+    return text
 
 
 # ── Hardware Nicla Vision ─────────────────────────────────────────────────
@@ -526,17 +511,17 @@ def main():
         if m is not None:
             mm_na_px = m["mm_na_px"]
         ted = time.ticks_ms()
-        stav, vx, vy, vyaw, vz = nav.krok(m, vyska_tof, ted)
+        stav, vpred, vpravo, toc, vz = nav.krok(m, vyska_tof, ted)
 
         # Dron dostává povely po UARTu každý snímek
-        radek = zprava(seq, stav, m, vx, vy, vyaw, vz)
+        radek = zprava(seq, stav, vpred, vpravo, toc, vz)
         uart.write(radek)
         seq = (seq + 1) & 0xFFFF
 
         # Terminál: stejné povely čitelně (omezeně, aby se dal číst)
         if stav != posledni_stav or time.ticks_diff(ted, posledni_vypis) >= VYPIS_INTERVAL_MS:
             if VYPIS_POVELU:
-                print(povel_text(stav, m, vx, vy, vyaw, vz))
+                print(povel_text(stav, vpred, vpravo, toc, vz))
             if VYPIS_PROTOKOLU:
                 print(radek, end="")
             posledni_stav = stav
